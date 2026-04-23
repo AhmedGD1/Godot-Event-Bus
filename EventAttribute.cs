@@ -1,6 +1,6 @@
 using System;
 
-namespace Utilities.Events;
+using Messaging;
 
 [AttributeUsage(AttributeTargets.Method)]
 public class EventHandlerAttribute : Attribute
