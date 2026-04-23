@@ -5,7 +5,7 @@ using System.Reflection;
 using Godot;
 using LinqExpr = System.Linq.Expressions.Expression;
 
-namespace Utilities.Events;
+using Messaging;
 
 public static class EventSubscriber
 {
