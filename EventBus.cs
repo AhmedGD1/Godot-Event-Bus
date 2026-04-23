@@ -1,117 +1,158 @@
-using System.Collections.Generic;
 using System;
+using System.Collections.Generic;
 using Godot;
 
-namespace Messaging;
+namespace Utilities.Events;
 
+/// <summary>
+/// A lightweight, type-safe event bus for Godot C#.
+///
+/// THREADING CONTRACT: All methods must be called from the Godot main thread.
+/// The bus performs no locking. Calling from a background thread causes silent data corruption.
+/// </summary>
 public static class EventBus
 {
-    private static readonly Dictionary<Type, List<Delegate>> listeners = new();
-    private static readonly Dictionary<Type, object> cachedInstances   = new();
+    private static readonly Dictionary<Type, object> _buckets = new();
 
-    #region Typed API
-
+    /// <summary>
+    /// Subscribes <paramref name="listener"/> to events of type <typeparamref name="T"/>.
+    /// Pass <paramref name="owner"/> to auto-remove when the node leaves the scene tree.
+    /// </summary>
     public static void AddListener<T>(Action<T> listener, Node owner = null)
     {
-        if (!listeners.TryGetValue(typeof(T), out var list))
-            listeners[typeof(T)] = list = new();
-        list.Add(listener);
-
+        GetOrCreate<T>().Add(listener);
         if (owner != null)
             owner.TreeExiting += () => RemoveListener(listener);
     }
 
+    /// <summary>
+    /// Subscribes a parameterless listener. Returns the wrapper — keep it to unsubscribe manually.
+    /// </summary>
     public static Action<T> AddListener<T>(Action listener, Node owner = null)
     {
-        void wrapper(T _) => listener();
-        AddListener((Action<T>)wrapper, owner);
-        return wrapper;
+        void Wrapper(T _) => listener();
+        AddListener((Action<T>)Wrapper, owner);
+        return Wrapper;
     }
 
+    /// <summary>Subscribes <paramref name="listener"/> to fire exactly once, then auto-removes.</summary>
     public static void AddListenerOnce<T>(Action<T> listener, Node owner = null)
     {
         Action<T> wrapper = null!;
-        wrapper = (T evt) =>
-        {
-            RemoveListener(wrapper);
-            listener(evt);
-        };
+        wrapper = evt => { RemoveListener(wrapper); listener(evt); };
         AddListener(wrapper, owner);
     }
 
-    public static void AddListenerOnce<T>(Action listener, Node owner = null) where T : new()
-    {
-        Action<T> wrapper = null!;
-        wrapper = (T _) =>
-        {
-            RemoveListener(wrapper);
-            listener();
-        };
-        AddListener(wrapper, owner);
-    }
+    /// <summary>Parameterless variant of <see cref="AddListenerOnce{T}(Action{T}, Node)"/>.</summary>
+    public static void AddListenerOnce<T>(Action listener, Node owner = null)
+        => AddListenerOnce<T>(_ => listener(), owner);
 
+    /// <summary>Unsubscribes a previously registered listener.</summary>
     public static void RemoveListener<T>(Action<T> listener)
     {
-        if (listeners.TryGetValue(typeof(T), out var list))
-            list.Remove(listener);
+        if (_buckets.TryGetValue(typeof(T), out var raw))
+            ((TypedBucket<T>)raw).Remove(listener);
     }
 
+    /// <summary>Fires all listeners registered for <typeparamref name="T"/>.</summary>
     public static void Trigger<T>(T evt)
     {
-        if (!listeners.TryGetValue(typeof(T), out var list))
+        if (evt is null)
+        {
+            GD.PushError($"[EventBus] Null event passed to Trigger<{typeof(T).Name}>.");
             return;
+        }
+        if (_buckets.TryGetValue(typeof(T), out var raw))
+            ((TypedBucket<T>)raw).Fire(evt);
+    }
 
-        for (int i = list.Count - 1; i >= 0; i--)
+    /// <summary>Fires using a default instance. <typeparamref name="T"/> needs a parameterless constructor.</summary>
+    public static void Trigger<T>() where T : new() => Trigger(new T());
+
+    /// <summary>Clears all listeners across every event type.</summary>
+    public static void Clear()
+    {
+        foreach (var b in _buckets.Values) ((IClearable)b).Clear();
+        _buckets.Clear();
+    }
+
+    /// <summary>Clears all listeners for <typeparamref name="T"/> only.</summary>
+    public static void Clear<T>()
+    {
+        if (_buckets.TryGetValue(typeof(T), out var raw))
+            ((TypedBucket<T>)raw).Clear();
+    }
+
+    internal static void RegisterWired<T>(Action<T> listener, Node owner)
+    {
+        GetOrCreate<T>().Add(listener);
+        owner.TreeExiting += () => RemoveListener(listener);
+    }
+
+    private interface IClearable { void Clear(); }
+
+    private sealed class TypedBucket<T> : IClearable
+    {
+        private Action<T>[]               _handlers = Array.Empty<Action<T>>();
+        private int                       _count;
+        private readonly HashSet<Action<T>> _set    = new();
+        private readonly List<Action<T>>  _pending  = new();
+        private bool                      _firing;
+
+        public void Add(Action<T> h)
         {
-            try
+            if (!_set.Add(h))
             {
-                if      (list[i] is Action<T>      action) action(evt);
-                else if (list[i] is Action<object> objAct) objAct(evt!);
+                GD.PushError($"[EventBus] Duplicate listener for {typeof(T).Name}.");
+                return;
             }
-            catch (Exception e)
+            if (_count == _handlers.Length)
+                Array.Resize(ref _handlers, Math.Max(4, _count * 2));
+            _handlers[_count++] = h;
+        }
+
+        public void Remove(Action<T> h)
+        {
+            if (_firing) { _pending.Add(h); return; }
+            DoRemove(h);
+        }
+
+        private void DoRemove(Action<T> h)
+        {
+            if (!_set.Remove(h)) return;
+            for (int i = 0; i < _count; i++)
             {
-                GD.PrintErr($"[EventBus] Listener threw during Trigger<{typeof(T).Name}>: {e.Message}");
+                if (_handlers[i] != h) continue;
+                // Shift remaining handlers left to preserve subscription order.
+                // The old swap-with-last trick was faster but broke FIFO firing.
+                Array.Copy(_handlers, i + 1, _handlers, i, _count - i - 1);
+                _handlers[--_count] = null!;
+                return;
             }
+        }
+
+        public void Fire(T evt)
+        {
+            _firing = true;
+            try   { for (int i = 0; i < _count; i++) _handlers[i]?.Invoke(evt); }
+            finally
+            {
+                _firing = false;
+                if (_pending.Count > 0) { foreach (var h in _pending) DoRemove(h); _pending.Clear(); }
+            }
+        }
+
+        public void Clear()
+        {
+            Array.Clear(_handlers, 0, _count);
+            _count = 0; _set.Clear(); _pending.Clear();
         }
     }
 
-    public static void Trigger<T>() where T : new()
+    private static TypedBucket<T> GetOrCreate<T>()
     {
-        if (!cachedInstances.TryGetValue(typeof(T), out var evt))
-            cachedInstances[typeof(T)] = evt = new T();
-        Trigger((T)evt);
-    }
-
-    #endregion
-
-    #region Utilities
-
-    public static void Clear()    => listeners.Clear();
-    public static void Clear<T>() => listeners.Remove(typeof(T));
-
-    #endregion
-
-    /// <summary>
-    /// Infrastructure for <see cref="EventSubscriber.WireEvents"/>.
-    /// Not intended for direct use.
-    /// </summary>
-    public static class Internal
-    {
-        public static void AddListener(Type eventType, Action<object> listener, Node owner = null)
-        {
-            if (!listeners.TryGetValue(eventType, out var list))
-                listeners[eventType] = list = new();
-            list.Add(listener);
-
-            if (owner != null)
-                owner.TreeExiting += () => RemoveListener(eventType, listener);
-        }
-
-        public static void RemoveListener(Type eventType, Action<object> listener)
-        {
-            if (listeners.TryGetValue(eventType, out var list))
-                list.Remove(listener);
-        }
+        if (!_buckets.TryGetValue(typeof(T), out var raw))
+            _buckets[typeof(T)] = raw = new TypedBucket<T>();
+        return (TypedBucket<T>)raw;
     }
 }
-

@@ -1,73 +1,112 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 using Godot;
+using LinqExpr = System.Linq.Expressions.Expression;
 
-namespace Messaging;
+namespace Utilities.Events;
 
 public static class EventSubscriber
 {
-    private static readonly HashSet<Node> wiredNodes = new();
+    private static readonly Dictionary<Type, WireEntry[]> _cache = new();
+    private static readonly HashSet<Node>                 _wired = new();
+
+    private static readonly BindingFlags _flags =
+        BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
 
     public static void WireEvents(this Node node)
     {
-        if (!wiredNodes.Add(node))
+        if (!_wired.Add(node))
         {
-            GD.PushWarning($"[EventBus] WireEvents called more than once on {node.Name}. Second call ignored.");
+            GD.PushError($"[EventBus] WireEvents called twice on '{node.Name}' ({node.GetType().Name}). Ignoring duplicate.");
             return;
         }
 
-        node.TreeExiting += () => wiredNodes.Remove(node);
+        // Clean up the tracking entry when the node leaves the tree.
+        node.TreeExiting += () => _wired.Remove(node);
 
-        var binding = BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public;
-        var methods = node.GetType().GetMethods(binding);
+        foreach (ref readonly var entry in GetOrBuild(node.GetType()).AsSpan())
+            entry.Register(node);
+    }
 
-        foreach (var method in methods)
+    private static WireEntry[] GetOrBuild(Type nodeType)
+    {
+        if (_cache.TryGetValue(nodeType, out var cached)) return cached;
+
+        var entries = new List<WireEntry>();
+
+        foreach (var method in nodeType.GetMethods(_flags))
         {
-            var attribute = method.GetCustomAttribute<EventHandlerAttribute>();
+            var attr = method.GetCustomAttribute<EventHandlerAttribute>();
+            if (attr is null) continue;
 
-            if (attribute is null) 
-                continue;
-            
             var parameters = method.GetParameters();
+            var eventType  = attr.EventType ?? (parameters.Length > 0 ? parameters[0].ParameterType : null);
 
-            Type eventType = attribute.EventType ?? GetEventTypeOrNull(parameters);                                  
-
-            if (eventType == null)
+            if (eventType is null)
             {
-                GD.PushError($"[EventBus] {method.Name} must have a parameter or use [EventHandler(typeof(...))].");
+                GD.PushError(
+                    $"[EventBus] '{nodeType.Name}.{method.Name}': no parameter and no explicit type. " +
+                    $"Add a parameter or use [EventHandler(typeof(YourEvent))].");
                 continue;
             }
 
-            bool passEventToMethod = parameters.Length > 0;
+            if (parameters.Length > 0 && parameters[0].ParameterType != eventType)
+            {
+                GD.PushError(
+                    $"[EventBus] '{nodeType.Name}.{method.Name}': " +
+                    $"explicit type ({eventType.Name}) != parameter type ({parameters[0].ParameterType.Name}).");
+                continue;
+            }
 
-            var args = new object[1];
+            // Pick the right EventBus registration method at cache-build time
+            var registerMethod = attr.Once
+                ? GetOnceMethod(eventType)
+                : GetRegisterWiredMethod(eventType);
 
-            Action<object> invoke = passEventToMethod
-                ? evt => { args[0] = evt; method.Invoke(node, args); }
-                : _   => method.Invoke(node, null);
-            
-            Action<object> handler = attribute.Once ? MakeOnce(eventType, invoke) : invoke;
-
-            EventBus.Internal.AddListener(eventType, handler, node);
+            entries.Add(new WireEntry(Compile(method, nodeType, eventType, parameters.Length > 0, registerMethod)));
         }
+
+        return _cache[nodeType] = entries.ToArray();
     }
 
-    private static Type GetEventTypeOrNull(ParameterInfo[] parameters) =>
-        parameters.Length > 0 ? parameters[0].ParameterType : null;
-
-    private static Action<object> MakeOnce(Type eventType, Action<object> invoke)
+    private static Action<Node> Compile(
+        MethodInfo method, Type nodeType, Type eventType, bool passEvent, MethodInfo registerMethod)
     {
-        Action<object> handler = null!;
+        var nodeParam   = LinqExpr.Parameter(typeof(Node), "node");
+        var castNode    = LinqExpr.Convert(nodeParam, nodeType);
 
-        handler = evt =>
-        {
-            EventBus.Internal.RemoveListener(eventType, handler);
-            invoke(evt);  
-        };
+        // Inner handler: (T evt) => ((MyNode)node).Method(evt)  — or no-arg variant
+        var evtParam    = LinqExpr.Parameter(eventType, "evt");
+        var handlerBody = passEvent
+            ? LinqExpr.Call(castNode, method, evtParam)
+            : LinqExpr.Call(castNode, method);
+        var handler     = LinqExpr.Lambda(typeof(Action<>).MakeGenericType(eventType), handlerBody, evtParam);
 
-        return handler;
+        var call = LinqExpr.Call(null, registerMethod, handler, nodeParam);
+
+        return LinqExpr.Lambda<Action<Node>>(call, nodeParam).Compile();
     }
+
+    private static MethodInfo GetRegisterWiredMethod(Type eventType) =>
+        typeof(EventBus)
+            .GetMethod(nameof(EventBus.RegisterWired), BindingFlags.NonPublic | BindingFlags.Static)!
+            .MakeGenericMethod(eventType);
+
+    private static MethodInfo GetOnceMethod(Type eventType) =>
+        typeof(EventBus)
+            .GetMethods(BindingFlags.Public | BindingFlags.Static)
+            .First(m => m.Name == nameof(EventBus.AddListenerOnce) &&
+                        m.GetParameters() is { Length: 2 } p &&
+                        p[0].ParameterType.IsGenericType &&
+                        p[0].ParameterType.GetGenericTypeDefinition() == typeof(Action<>))
+            .MakeGenericMethod(eventType);
 }
 
-
+internal readonly struct WireEntry
+{
+    private readonly Action<Node> _register;
+    public WireEntry(Action<Node> register) => _register = register;
+    public void Register(Node node) => _register(node);
+}
