@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using Godot;
 
-namespace Utilities.Events;
+using Messaging;
 
 /// <summary>
 /// A lightweight, type-safe event bus for Godot C#.
